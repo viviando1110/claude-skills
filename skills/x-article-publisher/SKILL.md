@@ -1,17 +1,18 @@
 ---
-name: x-article-publisher
-description: Publish Markdown articles to X (Twitter) Articles via Playwright browser automation. Converts Markdown to rich text, handles images with block-index positioning, generates code block images, and saves as draft.
+name: x-article
+description: >
+  Manage Markdown articles for X Articles. Three modes:
+  export (publish .md as draft), sync (auto-push .md changes to X editor),
+  proofread (expert review + diff against local source).
+argument-hint: "<export|sync|proofread> [path-to-markdown]"
 ---
 
-# X Article Publisher
+# X Article — Export, Sync & Proofread
 
-Publish Markdown articles to X Articles with one command. Preserves all formatting including headers, bold, italic, links, lists, blockquotes. Converts code blocks to styled images since X doesn't support code formatting.
-
-## When to Use This Skill
-
-- User wants to publish a Markdown file to X/Twitter Articles
-- User says "publish to X", "post to X Articles", "send to Twitter"
-- User provides a .md file and wants it on X
+Manage Markdown articles for X Articles with three modes:
+- **export** — Publish a .md file as a draft to X Articles (rich text, images, code blocks)
+- **sync** — Watch a .md file for changes and re-push to X editor on each turn
+- **proofread** — Expert editorial review + diff between X editor and local source
 
 ## Requirements
 
@@ -34,14 +35,30 @@ pip install Pillow Pygments
 # Linux clipboard: requires xclip or xsel installed
 ```
 
-## Instructions
+---
+
+## Mode Routing
+
+Check `$0` (the first argument after the skill name) to determine which mode to run:
+
+- `$0 = export` → Run **Export Mode** (Steps 0–9 below)
+- `$0 = sync` → Run **Sync Mode**
+- `$0 = proofread` → Run **Proofread Mode**
+
+If `$0` is empty or unrecognized, ask the user which mode they want.
+
+The markdown file path is `$1` (the second argument). If not provided, ask the user for it.
+
+---
+
+## Export Mode
+
+Publish a Markdown file as a rich-text draft to X Articles. This is the full export pipeline.
 
 ### Step 0: Parse the Markdown
 
-Run the parse script to extract structured data:
-
 ```bash
-python3 SKILL_DIR/scripts/parse_markdown.py "/path/to/article.md"
+python3 SKILL_DIR/parse_markdown.py "$1"
 ```
 
 This outputs JSON:
@@ -68,7 +85,7 @@ This outputs JSON:
 If `code_blocks` is non-empty, generate images for each:
 
 ```bash
-python3 SKILL_DIR/scripts/code_to_image.py \
+python3 SKILL_DIR/code_to_image.py \
   --code "print('hello world')" \
   --language python \
   --output /tmp/code_block_1.png \
@@ -109,10 +126,10 @@ If `cover_image` exists:
 
 ### Step 5: Paste Article Content
 
-This is the key step. Use clipboard to paste rich text:
+Use clipboard to paste rich text:
 
 ```bash
-python3 SKILL_DIR/scripts/copy_to_clipboard.py --html "<h2>My Section</h2><p>Content here...</p>"
+python3 SKILL_DIR/copy_to_clipboard.py --html "<h2>My Section</h2><p>Content here...</p>"
 ```
 
 Then in Playwright:
@@ -162,14 +179,145 @@ For each divider position (reverse order):
 
 Print a summary:
 ```
-✅ Article draft saved to X Articles!
-   Title: {title}
-   Cover image: {yes/no}
-   Content images: {count}
-   Code block images: {count}
-   Dividers: {count}
-   Status: DRAFT (review and publish manually at x.com)
+Article draft saved to X Articles!
+  Title: {title}
+  Cover image: {yes/no}
+  Content images: {count}
+  Code block images: {count}
+  Dividers: {count}
+  Status: DRAFT (review and publish manually at x.com)
 ```
+
+---
+
+## Sync Mode
+
+Watch a markdown file for changes and re-push content to the X editor between turns.
+
+**Limitation**: Claude Code is turn-based, so changes are detected and pushed when the user sends a message — not in real-time.
+
+### Starting Sync: `/x-article sync <path>`
+
+**Step 1: Start the file watcher**
+
+```bash
+python3 SKILL_DIR/sync_watcher.py "$1" --state /tmp/x-article-sync.json &
+```
+
+Run this as a background process. It polls the file's mtime every second and writes change events to the state file.
+
+**Step 2: Run initial full export**
+
+Execute the full Export Mode (Steps 0–9 above) to push the initial content to X Articles.
+
+**Step 3: Inform the user**
+
+Tell the user:
+```
+Sync active. Watching: {filepath}
+Edit your .md file, then send any message to push changes to X.
+Say "stop" or run `/x-article sync stop` to end the sync session.
+```
+
+### On Each Subsequent Turn (while sync is active)
+
+1. Read the state file:
+   ```bash
+   python3 -c "import json; print(json.dumps(json.load(open('/tmp/x-article-sync.json')), indent=2))"
+   ```
+
+2. Check `change_count` — if it increased since last check, changes were detected.
+
+3. If changes detected:
+   a. Re-parse the markdown: `python3 SKILL_DIR/parse_markdown.py "$1"`
+   b. In the X Articles editor (via Playwright MCP):
+      - Select all content in the body (`Cmd+A` / `Ctrl+A`)
+      - Delete it
+      - Re-paste the updated HTML via clipboard (same as Export Step 5)
+      - Re-insert images and dividers if needed (same as Export Steps 6–7)
+   c. Report: "Pushed {change_count} change(s) to X editor."
+
+4. If no changes: "No changes detected since last sync."
+
+### Stopping Sync: `/x-article sync stop`
+
+```bash
+python3 SKILL_DIR/sync_watcher.py --stop --state /tmp/x-article-sync.json
+```
+
+Report: "Sync stopped. The article remains as a draft in X — review and publish manually."
+
+---
+
+## Proofread Mode
+
+Expert editorial review of the article in the X editor, plus a diff against local source.
+
+### Step 0: Scrape the X Editor
+
+Using Playwright MCP, extract the current article content from the X Articles editor:
+
+1. Navigate to `https://x.com/compose/articles` (or confirm it's already open)
+2. Extract the title from the title input field
+3. Extract the body innerHTML from `[contenteditable="true"]`
+   - Fallback selectors: `[data-testid="articleBody"]`, `div[role="textbox"]`, `.public-DraftEditor-content`
+4. Save the scraped HTML to `/tmp/x-article-scraped.html`
+
+If the editor is empty or not accessible, tell the user to open the X Articles editor with a draft loaded first.
+
+### Step 1: Expert Editorial Review
+
+Activate an expert proofreader persona to review the article at the highest quality bar.
+
+**Expert persona** (apply internally per expert-role-refiner methodology — do NOT explain the persona to the user, just produce expert-quality output):
+
+Former senior editor at The Atlantic with 12 years editing long-form tech journalism. Previously edited at Wired and Ars Technica. Known for transforming dense technical content into compelling, accessible narratives without dumbing anything down. Particular strengths: structural architecture of arguments, ruthless cutting of filler, rhythm and pacing in technical prose, and ensuring every paragraph earns its place. Has a side specialty in platform-native writing — understands how formatting, length, and structure differ between blog posts, newsletters, and social media long-form (like X Articles). Applies the "would I share this?" test to every piece.
+
+**Review the article against these 8 criteria:**
+
+1. **Structural flow** — Does the piece have a clear arc? Does each section earn its position? Is there a compelling hook and a satisfying conclusion?
+2. **Clarity** — Can a smart reader outside the exact niche follow the argument? Are there jargon gaps or assumed knowledge?
+3. **Concision** — What can be cut without losing meaning? Flag filler sentences, redundant phrases, and bloated paragraphs.
+4. **Rhythm & pacing** — Does sentence length vary? Are there walls of text that need breaking up? Does the piece maintain momentum?
+5. **Hooks & transitions** — Does each section opening pull the reader forward? Are transitions smooth or jarring?
+6. **Technical accuracy** — Are claims precise? Are there overstatements, hedging, or hand-waving where specifics are needed?
+7. **Voice consistency** — Does the tone stay consistent throughout? Are there tonal shifts that feel unintentional?
+8. **X Articles formatting** — Is the piece optimized for the platform? Appropriate header usage, paragraph length for screen reading, effective use of bold/emphasis, good break points?
+
+**Apply the 0.1% quality bar**: Would a top editor look at this piece and say "this is ready"? If not, what's missing?
+
+### Step 2: Diff Comparison
+
+Compare the X editor content against the local markdown source:
+
+```bash
+python3 SKILL_DIR/diff_content.py --html-file /tmp/x-article-scraped.html --markdown "$1"
+```
+
+This produces:
+- Match percentage between X editor and local .md
+- Unified diff showing any divergence
+- Summary of lines added/removed
+
+### Step 3: Combined Report
+
+Present a single report with three sections:
+
+**1. Expert Editorial Review**
+- Overall assessment (1-2 sentences)
+- Issue-by-issue breakdown, prioritized by impact
+- For each issue: what's wrong, where it is, and a specific suggested fix
+- A "quick wins" section for easy improvements
+
+**2. Source Diff**
+- The diff summary and any notable divergences
+- If the X editor content diverges from local .md, flag this clearly — the user needs to decide which version is authoritative
+
+**3. Recommended Actions**
+- Prioritized list: fix these first (high-impact), then these (medium), then nice-to-have
+- If the article is ready to publish, say so explicitly
+
+---
 
 ## Error Handling
 
@@ -178,6 +326,7 @@ Print a summary:
 - If Articles editor doesn't load → X Premium may not be active
 - If image upload fails → Check file path, format (jpg/png/gif/webp), and network
 - If clipboard paste loses formatting → Ensure copy_to_clipboard.py ran successfully
+- If sync state file is missing → Watcher may have crashed; restart with `/x-article sync <path>`
 
 ## Supported Markdown
 
@@ -202,5 +351,5 @@ Print a summary:
 ## File Paths
 
 - `SKILL_DIR` = the directory containing this SKILL.md file
-- Scripts are at `SKILL_DIR/scripts/`
+- Scripts are at `SKILL_DIR/` (same directory as this file)
 - All image paths from parse output are absolute (resolved from the .md file location)
